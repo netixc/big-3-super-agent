@@ -1,0 +1,19 @@
+{
+  "name": "content-gen",
+  "version": "1.0.0",
+  "description": "Content Generation App with Sora Video API",
+  "private": true,
+  "scripts": {
+    "dev": "./start-dev.sh",
+    "dev-simple": "./start-dev-simple.sh",
+    "start": "./start-dev.sh",
+    "frontend": "cd frontend && npm run dev",
+    "backend": "cd backend && source .venv/bin/activate && python main.py",
+    "install-deps": "cd frontend && npm install && cd ../backend && uv sync",
+    "build": "cd frontend && npm run build",
+    "test": "cd backend && source .venv/bin/activate && pytest tests/ -v"
+  },
+  "keywords": ["sora", "video", "generation", "ai", "fastapi", "vue"],
+  "author": "Content Gen Team",
+  "license": "MIT"
+}
