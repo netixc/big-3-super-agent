@@ -1,21 +1,22 @@
 # Big Three Realtime Agents
-> Voice agent (OpenAI Realtime API) that orchestrates coding agents (Claude Code) and browser agents (Gemini Computer Use)
-> 
+> Voice agent (OpenAI Realtime API) that orchestrates coding agents (Claude Code CLI) and browser agents (Gemini Computer Use)
+>
 > **See this codebase in action [here](https://youtu.be/Ur3TJm0BckQ)**
-> 
+>
 
 <img src="images/big-3-super-agent.png" alt="Big Three Super Agent" style="max-width: 800px; width: 100%;">
 
 A unified voice-controlled orchestrator that coordinates three types of AI agents:
 1. **OpenAI Realtime Voice Agent** - Natural voice interactions and orchestration
-2. **Claude Code Agentic Coder** - Software development and file operations
+2. **Claude Code Agentic Coder** - Software development via CLI (subscription-based, no API key needed)
 3. **Gemini Browser Agent** - Web automation and validation
 
 ## Requirements
 
 - **Python 3.11+**
 - **[Astral uv](https://docs.astral.sh/uv/)** - Fast Python package installer and runner
-- **API Keys**: OpenAI, Anthropic (Claude), Google (Gemini)
+- **Claude CLI** - Installed with Claude Code subscription (no API key needed)
+- **API Keys**: OpenAI (for Realtime API), Google Gemini (for browser automation)
 - **Playwright**: For browser automation (`playwright install` after setup)
 
 Install `uv` if you don't have it:
