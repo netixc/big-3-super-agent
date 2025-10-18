@@ -54,6 +54,7 @@ import asyncio
 import textwrap
 import urllib.request
 import urllib.error
+import urllib.parse
 import shutil
 import time
 import uuid
@@ -121,9 +122,9 @@ except ImportError as exc:
 
 # OpenAI Realtime API
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-REALTIME_API_URL = os.environ.get("REALTIME_API_URL", "wss://api.openai.com/v1/realtime")
-REALTIME_MODEL_DEFAULT = os.environ.get("REALTIME_MODEL_DEFAULT", "gpt-realtime-2025-08-28")
-REALTIME_MODEL_MINI = os.environ.get("REALTIME_MODEL_MINI", "gpt-realtime-mini-2025-10-06")
+REALTIME_API_URL = os.environ.get("REALTIME_API_URL")
+REALTIME_MODEL_DEFAULT = os.environ.get("REALTIME_MODEL_DEFAULT")
+REALTIME_MODEL_MINI = os.environ.get("REALTIME_MODEL_MINI")
 REALTIME_API_URL_TEMPLATE = f"{REALTIME_API_URL}?model={{model}}"
 REALTIME_VOICE_CHOICE = os.environ.get("REALTIME_AGENT_VOICE", "shimmer")
 BROWSER_TOOL_STARTING_URL = os.environ.get(
@@ -140,7 +141,7 @@ RATE = 24000
 DEFAULT_CLAUDE_MODEL = os.environ.get(
     "CLAUDE_AGENT_MODEL", "claude-sonnet-4-5-20250929"
 )
-ENGINEER_NAME = os.environ.get("ENGINEER_NAME", "Dan")
+ENGINEER_NAME = os.environ.get("ENGINEER_NAME")
 REALTIME_ORCH_AGENT_NAME = os.environ.get("REALTIME_ORCH_AGENT_NAME", "ada")
 CLAUDE_CODE_TOOL = "claude_code"
 CLAUDE_CODE_TOOL_SLUG = "claude_code"
@@ -155,6 +156,13 @@ AGENTIC_BROWSERING_TYPE = "agentic_browsering"
 SCREEN_WIDTH = 1440
 SCREEN_HEIGHT = 900
 
+# Agent Zero configuration
+AGENT_ZERO_API_URL = os.environ.get("AGENT_ZERO_API_URL")
+AGENT_ZERO_API_KEY = os.environ.get("AGENT_ZERO_API_KEY")
+AGENT_ZERO_TOOL = "agent_zero"
+AGENT_ZERO_TOOL_SLUG = "agent_zero"
+AGENTIC_GENERAL_TYPE = "agentic_general"
+
 # Common agent configuration (defined after AGENT_WORKING_DIRECTORY below)
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -165,6 +173,7 @@ AGENT_WORKING_DIRECTORY = Path(__file__).parent.parent / "content-gen"
 AGENTS_BASE_DIR = AGENT_WORKING_DIRECTORY / "agents"
 CLAUDE_CODE_REGISTRY_PATH = AGENTS_BASE_DIR / CLAUDE_CODE_TOOL_SLUG / "registry.json"
 GEMINI_REGISTRY_PATH = AGENTS_BASE_DIR / GEMINI_TOOL_SLUG / "registry.json"
+AGENT_ZERO_REGISTRY_PATH = AGENTS_BASE_DIR / AGENT_ZERO_TOOL_SLUG / "registry.json"
 
 # Console for rich output
 console = Console()
@@ -601,6 +610,368 @@ class GeminiBrowserAgent:
     def _denormalize_y(self, y: int) -> int:
         """Convert normalized y coordinate (0-999) to actual pixel coordinate."""
         return int(y / 1000 * SCREEN_HEIGHT)
+
+
+# ================================================================
+# AgentZeroAgent - General-purpose agent with Agent Zero API
+# ================================================================
+
+
+class AgentZeroAgent:
+    """
+    General-purpose agent powered by Agent Zero API.
+
+    Handles diverse tasks through Agent Zero's external API including:
+    - Natural language processing and generation
+    - File analysis and manipulation
+    - Multi-turn conversations with context
+    - Log retrieval and chat management
+    """
+
+    def __init__(self, logger=None):
+        """Initialize Agent Zero agent."""
+        self.logger = logger or logging.getLogger("AgentZeroAgent")
+
+        # Validate Agent Zero API configuration
+        if not AGENT_ZERO_API_KEY:
+            raise ValueError("AGENT_ZERO_API_KEY environment variable not set")
+
+        self.api_url = AGENT_ZERO_API_URL
+        self.api_key = AGENT_ZERO_API_KEY
+
+        # Registry management
+        self.registry_lock = threading.Lock()
+        self.agent_registry = self._load_agent_registry()
+
+        self.logger.info("Initialized AgentZeroAgent")
+
+    # ------------------------------------------------------------------ #
+    # Agent registry helpers
+    # ------------------------------------------------------------------ #
+
+    def _load_agent_registry(self) -> Dict[str, Any]:
+        """Load agent registry from disk."""
+        if not AGENT_ZERO_REGISTRY_PATH.exists():
+            return {"agents": {}}
+
+        try:
+            with AGENT_ZERO_REGISTRY_PATH.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+                if "agents" not in data:
+                    data["agents"] = {}
+                return data
+        except Exception as exc:
+            self.logger.error(f"Failed to load agent registry: {exc}")
+            return {"agents": {}}
+
+    def _save_agent_registry(self):
+        """Save agent registry to disk."""
+        AGENT_ZERO_REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with AGENT_ZERO_REGISTRY_PATH.open("w", encoding="utf-8") as fh:
+                json.dump(self.agent_registry, fh, indent=2)
+        except Exception as exc:
+            self.logger.error(f"Failed to save agent registry: {exc}")
+
+    def _register_agent(self, agent_name: str, metadata: Dict[str, Any]):
+        """Register an Agent Zero agent in the registry."""
+        with self.registry_lock:
+            self.agent_registry.setdefault("agents", {})[agent_name] = {
+                "tool": AGENT_ZERO_TOOL,
+                "type": AGENTIC_GENERAL_TYPE,
+                "created_at": metadata.get(
+                    "created_at", datetime.now(timezone.utc).isoformat()
+                ),
+                "context_id": metadata.get("context_id"),
+                "lifetime_hours": metadata.get("lifetime_hours", 24),
+            }
+            self._save_agent_registry()
+
+    def _get_agent_by_name(self, agent_name: str) -> Optional[Dict[str, Any]]:
+        """Get agent metadata by name."""
+        return self.agent_registry.get("agents", {}).get(agent_name)
+
+    def _agent_directory(self, agent_name: str) -> Path:
+        """Get agent working directory path."""
+        return AGENTS_BASE_DIR / AGENT_ZERO_TOOL_SLUG / agent_name
+
+    # ------------------------------------------------------------------ #
+    # Agent Zero API methods
+    # ------------------------------------------------------------------ #
+
+    def _make_api_request(
+        self, endpoint: str, method: str = "POST", data: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Make a request to Agent Zero API."""
+        url = f"{self.api_url}{endpoint}"
+        headers = {
+            "X-API-KEY": self.api_key,
+            "Content-Type": "application/json",
+        }
+
+        try:
+            if method == "GET":
+                # For GET requests, encode data as query parameters
+                if data:
+                    query_string = urllib.parse.urlencode(data)
+                    url = f"{url}?{query_string}"
+                req = urllib.request.Request(url, headers=headers, method="GET")
+            else:
+                # For POST requests, send as JSON body
+                json_data = json.dumps(data or {}).encode("utf-8")
+                req = urllib.request.Request(url, data=json_data, headers=headers, method=method)
+
+            with urllib.request.urlopen(req, timeout=300) as response:
+                response_data = json.loads(response.read().decode("utf-8"))
+                return {"ok": True, "data": response_data}
+
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8")
+            try:
+                error_data = json.loads(error_body)
+                error_msg = error_data.get("error", str(e))
+            except json.JSONDecodeError:
+                error_msg = error_body or str(e)
+
+            self.logger.error(f"Agent Zero API error ({e.code}): {error_msg}")
+            return {"ok": False, "error": f"API error ({e.code}): {error_msg}"}
+
+        except Exception as exc:
+            self.logger.exception(f"Failed to make API request to {endpoint}")
+            return {"ok": False, "error": str(exc)}
+
+    def create_agent(
+        self, agent_name: Optional[str] = None, lifetime_hours: int = 24
+    ) -> Dict[str, Any]:
+        """Create a new Agent Zero agent."""
+        try:
+            # Generate agent name if not provided
+            if not agent_name:
+                agent_name = f"agent_zero_{uuid.uuid4().hex[:8]}"
+
+            # Check if agent already exists
+            if self._get_agent_by_name(agent_name):
+                return {
+                    "ok": False,
+                    "error": f"Agent '{agent_name}' already exists",
+                }
+
+            # Send initial message to create context
+            result = self._make_api_request(
+                "/api_message",
+                data={
+                    "message": f"Hello, I am {agent_name}. I'm ready to help with general tasks.",
+                    "lifetime_hours": lifetime_hours,
+                },
+            )
+
+            if not result["ok"]:
+                return result
+
+            response_data = result["data"]
+            context_id = response_data.get("context_id")
+
+            if not context_id:
+                return {"ok": False, "error": "No context_id returned from Agent Zero"}
+
+            # Register agent
+            metadata = {
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "context_id": context_id,
+                "lifetime_hours": lifetime_hours,
+            }
+            self._register_agent(agent_name, metadata)
+
+            # Create agent directory
+            agent_dir = self._agent_directory(agent_name)
+            agent_dir.mkdir(parents=True, exist_ok=True)
+
+            self.logger.info(
+                f"Created Agent Zero agent '{agent_name}' with context_id: {context_id}"
+            )
+
+            return {
+                "ok": True,
+                "agent_name": agent_name,
+                "context_id": context_id,
+                "message": f"Agent '{agent_name}' created successfully",
+            }
+
+        except Exception as exc:
+            self.logger.exception("create_agent failed")
+            return {"ok": False, "error": f"Failed to create agent: {exc}"}
+
+    def send_message(
+        self,
+        agent_name: str,
+        message: str,
+        attachments: Optional[list] = None,
+    ) -> Dict[str, Any]:
+        """Send a message to an existing Agent Zero agent."""
+        try:
+            agent = self._get_agent_by_name(agent_name)
+            if not agent:
+                return {"ok": False, "error": f"Agent '{agent_name}' not found"}
+
+            context_id = agent.get("context_id")
+            if not context_id:
+                return {"ok": False, "error": f"Agent '{agent_name}' has no context_id"}
+
+            # Prepare request data
+            data = {
+                "context_id": context_id,
+                "message": message,
+                "lifetime_hours": agent.get("lifetime_hours", 24),
+            }
+
+            if attachments:
+                data["attachments"] = attachments
+
+            # Send message
+            result = self._make_api_request("/api_message", data=data)
+
+            if not result["ok"]:
+                return result
+
+            response_data = result["data"]
+
+            # Save response to agent directory
+            agent_dir = self._agent_directory(agent_name)
+            response_file = agent_dir / f"response_{int(time.time())}.json"
+            with response_file.open("w", encoding="utf-8") as fh:
+                json.dump(response_data, fh, indent=2)
+
+            return {
+                "ok": True,
+                "response": response_data.get("response"),
+                "response_file": str(response_file),
+            }
+
+        except Exception as exc:
+            self.logger.exception(f"send_message to '{agent_name}' failed")
+            return {"ok": False, "error": str(exc)}
+
+    def get_logs(
+        self, agent_name: str, length: int = 50
+    ) -> Dict[str, Any]:
+        """Retrieve logs from an Agent Zero agent."""
+        try:
+            agent = self._get_agent_by_name(agent_name)
+            if not agent:
+                return {"ok": False, "error": f"Agent '{agent_name}' not found"}
+
+            context_id = agent.get("context_id")
+            if not context_id:
+                return {"ok": False, "error": f"Agent '{agent_name}' has no context_id"}
+
+            # Get logs
+            result = self._make_api_request(
+                "/api_log_get",
+                data={"context_id": context_id, "length": length},
+            )
+
+            if not result["ok"]:
+                return result
+
+            response_data = result["data"]
+
+            return {
+                "ok": True,
+                "logs": response_data.get("log", {}),
+            }
+
+        except Exception as exc:
+            self.logger.exception(f"get_logs for '{agent_name}' failed")
+            return {"ok": False, "error": str(exc)}
+
+    def reset_agent(self, agent_name: str) -> Dict[str, Any]:
+        """Reset an Agent Zero agent's conversation history."""
+        try:
+            agent = self._get_agent_by_name(agent_name)
+            if not agent:
+                return {"ok": False, "error": f"Agent '{agent_name}' not found"}
+
+            context_id = agent.get("context_id")
+            if not context_id:
+                return {"ok": False, "error": f"Agent '{agent_name}' has no context_id"}
+
+            # Reset chat
+            result = self._make_api_request(
+                "/api_reset_chat",
+                data={"context_id": context_id},
+            )
+
+            if not result["ok"]:
+                return result
+
+            self.logger.info(f"Reset agent '{agent_name}' (context: {context_id})")
+
+            return {
+                "ok": True,
+                "message": f"Agent '{agent_name}' conversation history reset",
+            }
+
+        except Exception as exc:
+            self.logger.exception(f"reset_agent '{agent_name}' failed")
+            return {"ok": False, "error": str(exc)}
+
+    def delete_agent(self, agent_name: str) -> Dict[str, Any]:
+        """Delete an Agent Zero agent and terminate its chat."""
+        try:
+            agent = self._get_agent_by_name(agent_name)
+            if not agent:
+                return {"ok": False, "error": f"Agent '{agent_name}' not found"}
+
+            context_id = agent.get("context_id")
+            if context_id:
+                # Terminate chat
+                result = self._make_api_request(
+                    "/api_terminate_chat",
+                    data={"context_id": context_id},
+                )
+
+                if not result["ok"]:
+                    self.logger.warning(
+                        f"Failed to terminate chat for '{agent_name}': {result.get('error')}"
+                    )
+
+            # Remove from registry
+            with self.registry_lock:
+                if agent_name in self.agent_registry.get("agents", {}):
+                    del self.agent_registry["agents"][agent_name]
+                    self._save_agent_registry()
+
+            # Delete agent directory
+            agent_dir = self._agent_directory(agent_name)
+            if agent_dir.exists():
+                shutil.rmtree(agent_dir)
+
+            self.logger.info(f"Deleted agent '{agent_name}'")
+
+            return {
+                "ok": True,
+                "message": f"Agent '{agent_name}' deleted successfully",
+            }
+
+        except Exception as exc:
+            self.logger.exception(f"delete_agent '{agent_name}' failed")
+            return {"ok": False, "error": str(exc)}
+
+    def list_agents(self) -> Dict[str, Any]:
+        """List all registered Agent Zero agents."""
+        agents = self.agent_registry.get("agents", {})
+        return {
+            "ok": True,
+            "agents": [
+                {
+                    "name": name,
+                    "tool": AGENT_ZERO_TOOL,
+                    "type": AGENTIC_GENERAL_TYPE,
+                    **metadata,
+                }
+                for name, metadata in agents.items()
+            ],
+        }
 
 
 # ================================================================
@@ -1156,6 +1527,11 @@ class OpenAIRealtimeVoiceAgent:
 
         # Initialize sub-agents
         self.browser_agent = GeminiBrowserAgent(logger=self.logger)
+        self.agent_zero = None
+        try:
+            self.agent_zero = AgentZeroAgent(logger=self.logger)
+        except ValueError as e:
+            self.logger.warning(f"Agent Zero not available: {e}")
         self.agentic_coder = ClaudeCodeAgenticCoder(
             logger=self.logger,
             browser_agent=self.browser_agent,
@@ -1191,6 +1567,15 @@ class OpenAIRealtimeVoiceAgent:
         # Latency tracking
         self.speech_stopped_timestamp = None
         self.first_audio_delta_timestamp = None
+
+        # Interruption handling
+        self.agent_is_speaking = False  # Track if agent is currently speaking
+        self.current_response_id = None  # Track current response for cancellation
+
+        # VAD configuration - tunable parameters
+        self.vad_threshold = 0.5  # Speech detection threshold (0.0-1.0)
+        self.vad_prefix_padding_ms = 500  # Audio before speech starts (ms) - increased to capture start of speech
+        self.vad_silence_duration_ms = 2000  # Silence duration to detect end of speech (ms) - 2 seconds for natural pauses
 
         self.logger.info(
             f"Initialized OpenAIRealtimeVoiceAgent - Input: {input_mode}, Output: {output_mode}"
@@ -1591,7 +1976,12 @@ class OpenAIRealtimeVoiceAgent:
                             "type": "audio/pcm",
                             "rate": 24000,
                         },
-                        "turn_detection": {"type": "semantic_vad"},
+                        "turn_detection": {
+                            "type": "server_vad",  # Use server_vad instead of semantic_vad for better interruption support
+                            "threshold": self.vad_threshold,
+                            "prefix_padding_ms": self.vad_prefix_padding_ms,
+                            "silence_duration_ms": self.vad_silence_duration_ms,
+                        },
                         "transcription": {
                             "model": "gpt-4o-transcribe",
                         },
@@ -1675,6 +2065,33 @@ class OpenAIRealtimeVoiceAgent:
                         transcript, title="User Input (Audio)", style="blue"
                     )
 
+            elif event_type == "input_audio_buffer.speech_started":
+                # User started speaking - check if we need to interrupt
+                self.logger.info(f"[INTERRUPT] Speech started - agent_is_speaking={self.agent_is_speaking}, response_id={self.current_response_id}")
+                # Only interrupt if agent is actively speaking AND we have a response ID
+                # This prevents canceling responses before they start
+                if self.agent_is_speaking and self.current_response_id:
+                    self.logger.info("[INTERRUPT] User interruption detected - canceling current response")
+                    # Cancel the current response
+                    cancel_event = {
+                        "type": "response.cancel"
+                    }
+                    self.ws.send(json.dumps(cancel_event))
+                    self.logger.info("[INTERRUPT] Sent response.cancel event")
+
+                    # Commit the audio buffer to process the interrupting speech
+                    commit_event = {
+                        "type": "input_audio_buffer.commit"
+                    }
+                    self.ws.send(json.dumps(commit_event))
+                    self.logger.info("[INTERRUPT] Committed audio buffer")
+
+                    # Reset speaking state
+                    self.agent_is_speaking = False
+                    self.current_response_id = None
+
+                    self.logger.info("[INTERRUPT] Response canceled, state reset")
+
             elif event_type == "input_audio_buffer.speech_stopped":
                 # Track when user stopped speaking for latency measurement
                 self.speech_stopped_timestamp = time.time()
@@ -1731,15 +2148,23 @@ class OpenAIRealtimeVoiceAgent:
                         )
                         self.logger.debug(f"Voice latency: {latency:.3f}s")
 
-                # Auto-pause audio input when agent starts speaking
-                if not self.auto_paused_for_response and self.input_mode == "audio":
-                    self.auto_paused_for_response = True
-                    self.logger.debug("Auto-paused audio input (agent speaking)")
+                # Mark agent as speaking (for interruption detection)
+                if not self.agent_is_speaking:
+                    self.agent_is_speaking = True
+                    self.logger.info(f"[INTERRUPT] Agent started speaking - response_id={self.current_response_id}")
+
+                # No longer auto-pausing - audio continues flowing for interruption detection
 
                 audio_base64 = event.get("delta", "")
                 if audio_base64 and self.output_mode == "audio" and self.audio_stream:
                     audio_bytes = self.base64_decode_audio(audio_base64)
                     self.audio_stream.write(audio_bytes)
+
+            elif event_type == "response.created":
+                # Track the response ID for potential cancellation
+                response = event.get("response", {})
+                self.current_response_id = response.get("id")
+                self.logger.info(f"[INTERRUPT] Response created: {self.current_response_id}")
 
             # Handle function calls
             if event_type == "response.function_call_arguments.delta":
@@ -1793,10 +2218,11 @@ class OpenAIRealtimeVoiceAgent:
                             f"Cost: ${self.cumulative_cost_usd:.4f} USD"
                         )
 
-                # Resume audio input after agent finishes speaking
-                if self.auto_paused_for_response and self.input_mode == "audio":
-                    self.auto_paused_for_response = False
-                    self.logger.debug("Resumed audio input (agent done speaking)")
+                # Reset speaking state after agent finishes
+                self.logger.info("[INTERRUPT] Response done - resetting speaking state")
+                self.agent_is_speaking = False
+                self.current_response_id = None
+                # Audio input is no longer paused, so no need to resume
 
                 if self.auto_mode and self.awaiting_auto_close:
                     # Check elapsed time since auto-prompt started
@@ -1904,8 +2330,9 @@ class OpenAIRealtimeVoiceAgent:
 
         while self.running:
             try:
-                # Skip audio capture when paused (manual or auto)
-                if self.audio_paused or self.auto_paused_for_response:
+                # Skip audio capture only when manually paused (not auto-paused)
+                # Allow audio to flow during agent speech for interruption detection
+                if self.audio_paused:
                     time.sleep(0.1)
                     continue
 
@@ -2188,23 +2615,24 @@ class OpenAIRealtimeVoiceAgent:
                 "type": "function",
                 "name": "create_agent",
                 "description": (
-                    "Create and register a new agent. Two tool/type combinations available:\n"
+                    "Create and register a new agent. Three tool/type combinations available:\n"
                     f"1. tool='{CLAUDE_CODE_TOOL}' + type='{AGENTIC_CODING_TYPE}' for software development tasks\n"
-                    f"2. tool='{GEMINI_TOOL}' + type='{AGENTIC_BROWSERING_TYPE}' for browser automation tasks"
+                    f"2. tool='{GEMINI_TOOL}' + type='{AGENTIC_BROWSERING_TYPE}' for browser automation tasks\n"
+                    f"3. tool='{AGENT_ZERO_TOOL}' + type='{AGENTIC_GENERAL_TYPE}' for general-purpose AI tasks"
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "tool": {
                             "type": "string",
-                            "enum": [CLAUDE_CODE_TOOL, GEMINI_TOOL],
-                            "description": f"Tool to use: '{CLAUDE_CODE_TOOL}' for coding agents, '{GEMINI_TOOL}' for browser automation",
+                            "enum": [CLAUDE_CODE_TOOL, GEMINI_TOOL, AGENT_ZERO_TOOL],
+                            "description": f"Tool to use: '{CLAUDE_CODE_TOOL}' for coding, '{GEMINI_TOOL}' for browser automation, '{AGENT_ZERO_TOOL}' for general tasks",
                             "default": CLAUDE_CODE_TOOL,
                         },
                         "type": {
                             "type": "string",
-                            "enum": [AGENTIC_CODING_TYPE, AGENTIC_BROWSERING_TYPE],
-                            "description": f"Agent type: '{AGENTIC_CODING_TYPE}' for software development, '{AGENTIC_BROWSERING_TYPE}' for browser automation",
+                            "enum": [AGENTIC_CODING_TYPE, AGENTIC_BROWSERING_TYPE, AGENTIC_GENERAL_TYPE],
+                            "description": f"Agent type: '{AGENTIC_CODING_TYPE}' for development, '{AGENTIC_BROWSERING_TYPE}' for browser, '{AGENTIC_GENERAL_TYPE}' for general tasks",
                             "default": AGENTIC_CODING_TYPE,
                         },
                         "agent_name": {
@@ -2213,6 +2641,11 @@ class OpenAIRealtimeVoiceAgent:
                                 "Optional explicit codename for the agent. "
                                 "If omitted, a unique name is generated."
                             ),
+                        },
+                        "lifetime_hours": {
+                            "type": "number",
+                            "description": f"Lifetime in hours for Agent Zero agents (default: 24). Only applies to tool='{AGENT_ZERO_TOOL}'.",
+                            "default": 24,
                         },
                     },
                     "required": [],
@@ -2369,7 +2802,7 @@ class OpenAIRealtimeVoiceAgent:
     # ------------------------------------------------------------------ #
 
     def _tool_list_agents(self) -> Dict[str, Any]:
-        """List all registered agents from both registries."""
+        """List all registered agents from all registries."""
         # Get Claude Code agents
         claude_result = self.agentic_coder.list_agents()
         claude_agents = claude_result.get("agents", [])
@@ -2389,8 +2822,14 @@ class OpenAIRealtimeVoiceAgent:
                 }
             )
 
-        # Combine both lists
-        all_agents = claude_agents + browser_agents_list
+        # Get Agent Zero agents
+        agent_zero_list = []
+        if self.agent_zero:
+            agent_zero_result = self.agent_zero.list_agents()
+            agent_zero_list = agent_zero_result.get("agents", [])
+
+        # Combine all lists
+        all_agents = claude_agents + browser_agents_list + agent_zero_list
         self._log_agent_roster_panel(all_agents)
         return {"ok": True, "agents": all_agents}
 
@@ -2428,6 +2867,7 @@ class OpenAIRealtimeVoiceAgent:
         tool: str = CLAUDE_CODE_TOOL,
         type: str = AGENTIC_CODING_TYPE,
         agent_name: Optional[str] = None,
+        lifetime_hours: int = 24,
     ) -> Dict[str, Any]:
         """Create a new agent - routes to appropriate handler based on tool/type."""
         # Route to browser agent handler
@@ -2440,18 +2880,30 @@ class OpenAIRealtimeVoiceAgent:
                 tool=tool, agent_type=type, agent_name=agent_name
             )
 
+        # Route to Agent Zero handler
+        elif tool == AGENT_ZERO_TOOL and type == AGENTIC_GENERAL_TYPE:
+            if not self.agent_zero:
+                return {
+                    "ok": False,
+                    "error": "Agent Zero is not available. Please set AGENT_ZERO_API_KEY environment variable.",
+                }
+            return self.agent_zero.create_agent(
+                agent_name=agent_name, lifetime_hours=lifetime_hours
+            )
+
         # Invalid combination
         else:
             return {
                 "ok": False,
-                "error": f"Invalid tool/type combination: tool='{tool}', type='{type}'. Valid combinations: ('{CLAUDE_CODE_TOOL}', '{AGENTIC_CODING_TYPE}') or ('{GEMINI_TOOL}', '{AGENTIC_BROWSERING_TYPE}')",
+                "error": f"Invalid tool/type combination: tool='{tool}', type='{type}'. Valid combinations: ('{CLAUDE_CODE_TOOL}', '{AGENTIC_CODING_TYPE}'), ('{GEMINI_TOOL}', '{AGENTIC_BROWSERING_TYPE}'), or ('{AGENT_ZERO_TOOL}', '{AGENTIC_GENERAL_TYPE}')",
             }
 
     def _tool_command_agent(self, agent_name: str, prompt: str) -> Dict[str, Any]:
         """Command an agent - routes to appropriate handler based on agent type."""
-        # Check both registries to find the agent
+        # Check all registries to find the agent
         claude_agent = self.agentic_coder._get_agent_by_name(agent_name)
         browser_agent = self.browser_agent._get_agent_by_name(agent_name)
+        agent_zero_agent = self.agent_zero._get_agent_by_name(agent_name) if self.agent_zero else None
 
         # Route to Claude Code agent handler
         if claude_agent:
@@ -2468,7 +2920,11 @@ class OpenAIRealtimeVoiceAgent:
                 self.logger.exception("Browser agent command failed")
                 return {"ok": False, "error": f"Browser task failed: {exc}"}
 
-        # Agent not found in either registry
+        # Route to Agent Zero handler
+        elif agent_zero_agent:
+            return self.agent_zero.send_message(agent_name=agent_name, message=prompt)
+
+        # Agent not found in any registry
         else:
             return {
                 "ok": False,
@@ -2485,9 +2941,10 @@ class OpenAIRealtimeVoiceAgent:
 
     def _tool_delete_agent(self, agent_name: str) -> Dict[str, Any]:
         """Delete an agent - routes to appropriate handler based on agent type."""
-        # Check both registries to find the agent
+        # Check all registries to find the agent
         claude_agent = self.agentic_coder._get_agent_by_name(agent_name)
         browser_agent_data = self.browser_agent._get_agent_by_name(agent_name)
+        agent_zero_agent = self.agent_zero._get_agent_by_name(agent_name) if self.agent_zero else None
 
         # Route to Claude Code agent handler
         if claude_agent:
@@ -2518,11 +2975,15 @@ class OpenAIRealtimeVoiceAgent:
                 payload["warnings"] = warnings
             return payload
 
-        # Agent not found in either registry
+        # Route to Agent Zero handler
+        elif agent_zero_agent:
+            return self.agent_zero.delete_agent(agent_name=agent_name)
+
+        # Agent not found in any registry
         else:
             return {
                 "ok": False,
-                "error": f"Agent '{agent_name}' not found in either registry. Nothing to delete.",
+                "error": f"Agent '{agent_name}' not found in any registry. Nothing to delete.",
             }
 
     def _tool_browser_use(self, task: str, url: Optional[str] = None) -> Dict[str, Any]:
