@@ -57,6 +57,7 @@ import urllib.error
 import shutil
 import time
 import uuid
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -80,29 +81,21 @@ except ImportError:
         "dotenv not found. Please install it with `pip install python-dotenv`"
     )
 
-# Claude Agent SDK imports
-try:
-    from claude_agent_sdk import (
-        query,
-        ClaudeAgentOptions,
-        ClaudeSDKClient,
-        HookMatcher,
-        HookContext,
-        AssistantMessage,
-        SystemMessage,
-        UserMessage,
-        ResultMessage,
-        TextBlock,
-        ThinkingBlock,
-        ToolUseBlock,
-        ToolResultBlock,
-        tool,
-        create_sdk_mcp_server,
-    )
-except ImportError as exc:
-    raise ImportError(
-        "claude-agent-sdk not found. Install with `pip install claude-agent-sdk`."
-    ) from exc
+# Claude CLI configuration - No SDK needed, using CLI with subscription
+CLAUDE_CLI_PATH = os.environ.get("CLAUDE_CLI_PATH", None)
+
+def find_claude_cli() -> str:
+    """Find Claude CLI executable."""
+    if CLAUDE_CLI_PATH and os.path.isabs(CLAUDE_CLI_PATH):
+        return CLAUDE_CLI_PATH
+
+    # Try local install path
+    home_path = os.path.join(os.path.expanduser("~"), ".claude", "local", "claude")
+    if os.path.exists(home_path):
+        return home_path
+
+    # Fallback to system PATH
+    return "claude"
 
 # Gemini imports
 try:
@@ -617,10 +610,10 @@ class GeminiBrowserAgent:
 
 class ClaudeCodeAgenticCoder:
     """
-    Manages Claude Code agents for software development tasks.
+    Manages Claude Code agents for software development tasks using CLI (subscription-based).
 
     Handles agent creation, command dispatch, and result retrieval.
-    Each agent maintains session continuity for context-aware development.
+    Uses Claude CLI with --dangerously-skip-permissions for cost-effective execution.
     """
 
     def __init__(self, logger=None, browser_agent=None):
@@ -632,8 +625,9 @@ class ClaudeCodeAgenticCoder:
         self.agent_registry = self._load_agent_registry()
 
         self.background_threads: list[threading.Thread] = []
+        self.claude_cli_path = find_claude_cli()
 
-        self.logger.info("Initialized ClaudeCodeAgenticCoder")
+        self.logger.info(f"Initialized ClaudeCodeAgenticCoder (CLI-based using {self.claude_cli_path})")
 
     # ------------------------------------------------------------------ #
     # Agent registry helpers
@@ -691,86 +685,41 @@ class ClaudeCodeAgenticCoder:
         return AGENTS_BASE_DIR / CLAUDE_CODE_TOOL_SLUG / agent_name
 
     # ------------------------------------------------------------------ #
-    # Browser tool for MCP
+    # CLI execution helper
     # ------------------------------------------------------------------ #
 
-    def _create_browser_tool(self, agent_name: str):
-        """Create browser_use tool for Claude agents with agent-specific screenshot directory."""
-
-        @tool(
-            "browser_use",
-            "Automate web validation tasks. Use this to validate your frontend work. Can navigate websites, interact with web pages, extract data, confirm (or reject) the work is done correctly, and perform complex multi-step validation tasks.",
-            {"task": str, "url": str},
-        )
-        async def browser_use_tool(args: dict[str, Any]) -> dict[str, Any]:
-            """Execute browser automation task with agent-specific screenshot storage."""
-            task = args.get("task", "")
-            url = args.get("url")
-
-            if not self.browser_agent:
-                return {
-                    "content": [
-                        {"type": "text", "text": "Browser agent not available."}
-                    ],
-                    "isError": True,
-                }
-
-            # Create agent-specific screenshot directory
-            session_id = (
-                datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:8]
+    def _execute_claude_cli(
+        self, prompt: str, working_dir: str, timeout: int = 1800
+    ) -> Dict[str, Any]:
+        """Execute Claude CLI with prompt."""
+        try:
+            result = subprocess.run(
+                [self.claude_cli_path, "--dangerously-skip-permissions", "-p", prompt],
+                cwd=working_dir,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
             )
-            agent_browser_dir = (
-                AGENTS_BASE_DIR
-                / CLAUDE_CODE_TOOL_SLUG
-                / agent_name
-                / "browser_tool"
-                / session_id
-            )
-            agent_browser_dir.mkdir(parents=True, exist_ok=True)
 
-            # Create a temporary browser agent instance with agent-specific screenshot dir
-            temp_browser = GeminiBrowserAgent(logger=self.logger)
-            temp_browser.screenshot_dir = agent_browser_dir
-            temp_browser.session_id = session_id
-            temp_browser.screenshot_counter = 0
-
-            # Run browser task in thread pool to avoid Playwright sync API conflict with asyncio
-            import concurrent.futures
-
-            loop = asyncio.get_event_loop()
-
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                result = await loop.run_in_executor(
-                    executor, lambda: temp_browser.execute_task(task, url)
-                )
-
-            # Cleanup browser
-            try:
-                temp_browser.cleanup_browser()
-            except:
-                pass
-
-            if result.get("ok"):
-                return {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"Browser task completed!\n\nResult:\n{result.get('data')}\n\nScreenshots: {result.get('screenshot_dir')}",
-                        }
-                    ]
-                }
+            if result.returncode == 0:
+                return {"ok": True, "output": result.stdout, "error": result.stderr}
             else:
                 return {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"Browser task failed: {result.get('error')}",
-                        }
-                    ],
-                    "isError": True,
+                    "ok": False,
+                    "error": f"CLI exited with code {result.returncode}\nStdout: {result.stdout}\nStderr: {result.stderr}",
                 }
-
-        return browser_use_tool
+        except subprocess.TimeoutExpired:
+            return {
+                "ok": False,
+                "error": f"CLI execution timed out after {timeout} seconds",
+            }
+        except FileNotFoundError:
+            return {
+                "ok": False,
+                "error": f"Claude CLI not found at {self.claude_cli_path}. Please install it or set CLAUDE_CLI_PATH environment variable.",
+            }
+        except Exception as exc:
+            return {"ok": False, "error": f"CLI execution failed: {exc}"}
 
     # ------------------------------------------------------------------ #
     # Prompt helpers
@@ -793,134 +742,6 @@ class ClaudeCodeAgenticCoder:
             return template.format(**kwargs)
         return template
 
-    # ------------------------------------------------------------------ #
-    # Agent observability
-    # ------------------------------------------------------------------ #
-
-    def _send_observability_event(
-        self,
-        agent_name: str,
-        hook_type: str,
-        session_id: str,
-        payload: dict,
-        summary: Optional[str] = None,
-    ) -> None:
-        """Send observability event to monitoring server (fails silently)."""
-        try:
-            event_data = {
-                "source_app": f"big-three-agents: {agent_name}",
-                "session_id": session_id,
-                "hook_event_type": hook_type,
-                "payload": payload,
-                "timestamp": int(datetime.now().timestamp() * 1000),
-            }
-
-            # Add summary if available
-            if summary:
-                event_data["summary"] = summary
-
-            req = urllib.request.Request(
-                "http://localhost:4000/events",
-                data=json.dumps(event_data).encode("utf-8"),
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": "BigThreeAgents/1.0",
-                },
-            )
-
-            with urllib.request.urlopen(req, timeout=2) as response:
-                if response.status != 200:
-                    self.logger.debug(
-                        f"Observability event returned {response.status} for {agent_name}"
-                    )
-
-        except urllib.error.URLError as e:
-            self.logger.debug(f"Observability event failed for {agent_name}: {e}")
-        except Exception as e:
-            self.logger.debug(f"Observability event error for {agent_name}: {e}")
-
-    def _create_observability_hook(
-        self,
-        agent_name: str,
-        hook_type: str,
-        session_id_holder: dict,
-        summarize: bool = True,
-    ) -> callable:
-        """Create observability hook for any hook type with optional summarization."""
-
-        async def hook(
-            input_data: Dict[str, Any],
-            tool_use_id: str | None,
-            context: HookContext,
-        ) -> Dict[str, Any]:
-            session_id = session_id_holder.get("session_id", "unknown")
-
-            # Generate summary if enabled
-            event_summary = None
-            if summarize:
-                event_summary = await self._generate_event_summary(
-                    agent_name, hook_type, input_data
-                )
-
-            # Send event with optional summary
-            self._send_observability_event(
-                agent_name, hook_type, session_id, input_data, event_summary
-            )
-            return {}  # Allow all operations
-
-        return hook
-
-    async def _generate_event_summary(
-        self, agent_name: str, hook_type: str, input_data: Dict[str, Any]
-    ) -> Optional[str]:
-        """Generate AI summary of event using Claude Agent SDK."""
-        try:
-            # Build summary prompt
-            tool_name = input_data.get("tool_name", "N/A")
-            tool_input = input_data.get("tool_input", {})
-
-            # Extract key context based on tool type
-            context_parts = []
-            if tool_name == "Bash":
-                command = tool_input.get("command", "")[:100]
-                context_parts.append(f"Command: {command}")
-            elif tool_name in ["Read", "Edit", "Write"]:
-                file_path = tool_input.get("file_path", "")
-                context_parts.append(f"File: {file_path}")
-
-            context = (
-                " | ".join(context_parts) if context_parts else "No specific context"
-            )
-
-            # Load prompts from files
-            system_prompt = self._read_prompt("event_summarizer_system_prompt.md")
-            user_prompt = self._render_prompt(
-                "event_summarizer_user_prompt.md",
-                AGENT_NAME=agent_name,
-                HOOK_TYPE=hook_type,
-                TOOL_NAME=tool_name,
-                CONTEXT=context,
-            )
-
-            # Use Claude Agent SDK query for fast summary
-            options = ClaudeAgentOptions(
-                model="claude-3-5-haiku-20241022",  # Fast model
-                system_prompt=system_prompt,
-            )
-
-            chunks = []
-            async for message in query(prompt=user_prompt, options=options):
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            chunks.append(block.text)
-
-            summary = "".join(chunks).strip()
-            return summary if summary else None
-
-        except Exception as e:
-            self.logger.debug(f"Summary generation failed: {e}")
-            return None
 
     # ------------------------------------------------------------------ #
     # Public API - Tool implementations
@@ -974,10 +795,8 @@ class ClaudeCodeAgenticCoder:
             }
 
         try:
-            agent_info = asyncio.run(
-                self._create_new_agent_async(
-                    tool=tool, agent_type=agent_type, agent_name=preferred_name
-                )
+            agent_info = self._create_new_agent_simple(
+                tool=tool, agent_type=agent_type, agent_name=preferred_name
             )
         except Exception as exc:
             self.logger.exception("create_agent failed")
@@ -1007,9 +826,7 @@ class ClaudeCodeAgenticCoder:
 
         # Prepare operator file and dispatch command
         try:
-            operator_path = asyncio.run(
-                self._prepare_operator_file(name=agent_name, prompt=prompt)
-            )
+            operator_path = self._prepare_operator_file(name=agent_name, prompt=prompt)
         except Exception as exc:
             self.logger.exception("Failed to prepare operator file")
             return {"ok": False, "error": f"Could not prepare operator log: {exc}"}
@@ -1073,164 +890,32 @@ class ClaudeCodeAgenticCoder:
         return payload
 
     # ------------------------------------------------------------------ #
-    # Async Claude agent operations
+    # CLI-based agent operations (no SDK, uses subscription)
     # ------------------------------------------------------------------ #
 
-    async def _create_new_agent_async(
+    def _create_new_agent_simple(
         self, tool: str, agent_type: str, agent_name: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Create new Claude Code agent asynchronously."""
+        """Create new Claude Code agent (CLI-based, no SDK)."""
         existing_names = list(self.agent_registry.get("agents", {}).keys())
+
         if agent_name:
             final_name = agent_name
         else:
-            candidate_name = await self._generate_agent_name(existing_names)
-            final_name = await self._dedupe_agent_name(candidate_name)
+            # Simple name generation without AI
+            timestamp = datetime.now(timezone.utc).strftime("%H%M%S")
+            final_name = f"Agent{timestamp}"
+            # Dedupe
+            suffix = 1
+            while final_name in existing_names:
+                final_name = f"Agent{timestamp}_{suffix}"
+                suffix += 1
 
         agent_dir = self._agent_directory(final_name)
         agent_dir.mkdir(parents=True, exist_ok=True)
 
-        system_prompt_text = self._render_prompt(
-            "agentic_coder_system_prompt_system_prompt.md",
-            OPERATOR_FILE="(assigned per task)",
-            WORKING_DIR=str(AGENT_WORKING_DIRECTORY),
-        )
-
-        # Session ID holder for hooks
-        session_id_holder = {"session_id": "unknown"}
-
-        # Create observability hooks
-        all_hook_types = [
-            "PreToolUse",
-            "PostToolUse",
-            "Notification",
-            "UserPromptSubmit",
-            "Stop",
-            "SubagentStop",
-            "PreCompact",
-            "SessionStart",
-            "SessionEnd",
-        ]
-
-        hooks = {
-            hook_type: [
-                HookMatcher(
-                    hooks=[
-                        self._create_observability_hook(
-                            final_name, hook_type, session_id_holder
-                        )
-                    ]
-                )
-            ]
-            for hook_type in all_hook_types
-        }
-
-        # Create browser tool if available
-        mcp_servers = {}
-        allowed_tools_list = [
-            "Read",
-            "Write",
-            "Edit",
-            "Bash",
-            "Glob",
-            "Grep",
-            "Task",
-            "WebFetch",
-            "WebSearch",
-            "BashOutput",
-            "SlashCommand",
-            "TodoWrite",
-        ]
-        disallowed_tools_list = ["KillShell", "NotebookEdit", "ExitPlanMode"]
-
-        if self.browser_agent:
-            browser_tool = self._create_browser_tool(final_name)
-            browser_server = create_sdk_mcp_server(
-                name="browser", version="1.0.0", tools=[browser_tool]
-            )
-            mcp_servers["browser"] = browser_server
-            allowed_tools_list.append("mcp__browser__browser_use")
-
-        options = ClaudeAgentOptions(
-            system_prompt={
-                "type": "preset",
-                "preset": "claude_code",
-                "append": system_prompt_text,
-            },
-            model=DEFAULT_CLAUDE_MODEL,
-            cwd=str(AGENT_WORKING_DIRECTORY),
-            permission_mode="bypassPermissions",
-            setting_sources=["project"],
-            hooks=hooks,
-            mcp_servers=mcp_servers,
-            allowed_tools=allowed_tools_list,
-            disallowed_tools=disallowed_tools_list,
-        )
-
-        # Simple greeting - system prompt already has instructions
-        greeting = f"Hi, you are {final_name}, a {agent_type} agent. Please acknowledge you're ready and briefly introduce yourself."
-
-        session_id: Optional[str] = None
-        transcript: list[str] = []
-
-        try:
-            async with ClaudeSDKClient(options=options) as client:
-                await client.query(greeting)
-
-                async for message in client.receive_response():
-                    # Log all message types
-                    if isinstance(message, UserMessage):
-                        self.logger.info(
-                            f"[{final_name}] UserMessage: {message.content}"
-                        )
-                    elif isinstance(message, SystemMessage):
-                        self.logger.info(
-                            f"[{final_name}] SystemMessage: subtype={message.subtype}, data={message.data}"
-                        )
-                    elif isinstance(message, AssistantMessage):
-                        self.logger.info(
-                            f"[{final_name}] AssistantMessage: model={message.model}, blocks={len(message.content)}"
-                        )
-                        for block in message.content:
-                            if isinstance(block, TextBlock):
-                                transcript.append(block.text)
-                                self.logger.info(
-                                    f"[{final_name}] TextBlock: {block.text}"
-                                )
-                            elif isinstance(block, ThinkingBlock):
-                                self.logger.info(
-                                    f"[{final_name}] ThinkingBlock: {block.thinking}"
-                                )
-                            elif isinstance(block, ToolUseBlock):
-                                self.logger.info(
-                                    f"[{final_name}] ToolUseBlock: name={block.name}, id={block.id}, input={block.input}"
-                                )
-                            elif isinstance(block, ToolResultBlock):
-                                self.logger.info(
-                                    f"[{final_name}] ToolResultBlock: tool_use_id={block.tool_use_id}, is_error={block.is_error}"
-                                )
-                    elif isinstance(message, ResultMessage):
-                        session_id = message.session_id
-                        # Update session_id_holder for hooks
-                        session_id_holder["session_id"] = session_id
-                        self.logger.info(
-                            f"[{final_name}] ResultMessage: subtype={message.subtype}, "
-                            f"session_id={message.session_id}, is_error={message.is_error}, "
-                            f"num_turns={message.num_turns}, duration_ms={message.duration_ms}, "
-                            f"cost_usd={message.total_cost_usd}, result={message.result}"
-                        )
-                        console.print(
-                            Panel(
-                                f"{message.result}",
-                                title=f"Agent '{final_name}' (ResultMessage)",
-                                border_style="green",
-                            )
-                        )
-        except Exception as exc:
-            raise RuntimeError(f"Claude agent initialization failed: {exc}") from exc
-
-        if not session_id:
-            raise RuntimeError("Failed to obtain session_id from Claude agent.")
+        # Generate simple session ID
+        session_id = f"{final_name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
 
         metadata = {
             "tool": tool,
@@ -1240,8 +925,14 @@ class ClaudeCodeAgenticCoder:
         }
         self._register_agent(final_name, session_id, metadata)
 
-        ready_text = " ".join(transcript).strip()
-        self.logger.info(f"Created agent '{final_name}' - session_id: {session_id}")
+        self.logger.info(f"Created CLI-based agent '{final_name}' - session_id: {session_id}")
+        console.print(
+            Panel(
+                f"Agent '{final_name}' created successfully!",
+                title=f"Agent '{final_name}'",
+                border_style="green",
+            )
+        )
 
         return {
             "name": final_name,
@@ -1249,18 +940,15 @@ class ClaudeCodeAgenticCoder:
             "directory": str(agent_dir),
         }
 
-    async def _prepare_operator_file(self, name: str, prompt: str) -> Path:
+    def _prepare_operator_file(self, name: str, prompt: str) -> Path:
         """Prepare operator log file for task."""
         agent_dir = self._agent_directory(name)
         agent_dir.mkdir(parents=True, exist_ok=True)
 
-        slug = await self._generate_operator_filename(prompt)
-        filename = f"{slug}.md"
+        # Simple filename generation
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        filename = f"task-{timestamp}.md"
         operator_path = agent_dir / filename
-
-        if operator_path.exists():
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-            operator_path = agent_dir / f"{slug}-{timestamp}.md"
 
         header = textwrap.dedent(
             f"""
@@ -1282,11 +970,9 @@ class ClaudeCodeAgenticCoder:
     def _run_agent_command_thread(
         self, agent_name: str, prompt: str, operator_path: Path
     ):
-        """Run agent command in background thread."""
+        """Run agent command in background thread using CLI."""
         try:
-            asyncio.run(
-                self._run_existing_agent_async(agent_name, prompt, operator_path)
-            )
+            self._run_existing_agent_cli(agent_name, prompt, operator_path)
         except Exception as exc:
             self.logger.exception(f"Background command for '{agent_name}' failed")
             failure_note = textwrap.dedent(
@@ -1300,98 +986,20 @@ class ClaudeCodeAgenticCoder:
             with operator_path.open("a", encoding="utf-8") as fh:
                 fh.write("\n" + failure_note + "\n")
 
-    async def _run_existing_agent_async(
+    def _run_existing_agent_cli(
         self, agent_name: str, prompt: str, operator_path: Path
     ):
-        """Run command on existing agent asynchronously."""
+        """Run command on existing agent using CLI."""
         agent = self._get_agent_by_name(agent_name)
         if not agent:
             raise RuntimeError(f"Agent '{agent_name}' not found in registry.")
 
-        resume_session = agent.get("session_id")
-        if not resume_session:
-            raise RuntimeError(f"No session_id stored for agent '{agent_name}'.")
-
-        system_prompt_text = self._render_prompt(
-            "agentic_coder_system_prompt_system_prompt.md",
-            OPERATOR_FILE=str(operator_path),
-            WORKING_DIR=agent.get("working_dir", str(AGENT_WORKING_DIRECTORY)),
-        )
-
-        session_id_holder = {"session_id": resume_session or "unknown"}
-
-        all_hook_types = [
-            "PreToolUse",
-            "PostToolUse",
-            "Notification",
-            "UserPromptSubmit",
-            "Stop",
-            "SubagentStop",
-            "PreCompact",
-            "SessionStart",
-            "SessionEnd",
-        ]
-
-        hooks = {
-            hook_type: [
-                HookMatcher(
-                    hooks=[
-                        self._create_observability_hook(
-                            agent_name, hook_type, session_id_holder
-                        )
-                    ]
-                )
-            ]
-            for hook_type in all_hook_types
-        }
-
-        # Create browser tool if available
-        mcp_servers = {}
-        allowed_tools_list = [
-            "Read",
-            "Write",
-            "Edit",
-            "Bash",
-            "Glob",
-            "Grep",
-            "Task",
-            "WebFetch",
-            "WebSearch",
-            "BashOutput",
-            "SlashCommand",
-            "TodoWrite",
-            "KillShell",
-        ]
-        disallowed_tools_list = ["NotebookEdit", "ExitPlanMode"]
-
-        if self.browser_agent:
-            browser_tool = self._create_browser_tool(agent_name)
-            browser_server = create_sdk_mcp_server(
-                name="browser", version="1.0.0", tools=[browser_tool]
-            )
-            mcp_servers["browser"] = browser_server
-            allowed_tools_list.append("mcp__browser__browser_use")
-
-        options = ClaudeAgentOptions(
-            system_prompt={
-                "type": "preset",
-                "preset": "claude_code",
-                "append": system_prompt_text,
-            },
-            model=DEFAULT_CLAUDE_MODEL,
-            cwd=agent.get("working_dir", str(AGENT_WORKING_DIRECTORY)),
-            permission_mode="bypassPermissions",
-            resume=resume_session,
-            setting_sources=["project"],
-            hooks=hooks,
-            mcp_servers=mcp_servers,
-            allowed_tools=allowed_tools_list,
-        )
+        working_dir = agent.get("working_dir", str(AGENT_WORKING_DIRECTORY))
 
         kickoff_note = textwrap.dedent(
             f"""
             ## Operator Update
-            - **Status:** Task dispatched for execution.
+            - **Status:** Task dispatched for execution via CLI.
             - **Prompt:** {prompt}
             - **Operator Log:** {operator_path}
             - **Timestamp:** {datetime.now(timezone.utc).isoformat()}
@@ -1401,116 +1009,58 @@ class ClaudeCodeAgenticCoder:
         with operator_path.open("a", encoding="utf-8") as fh:
             fh.write("\n" + kickoff_note + "\n")
 
-        new_session_id: Optional[str] = None
+        # Execute Claude CLI
+        result = self._execute_claude_cli(prompt, working_dir)
 
-        async with ClaudeSDKClient(options=options) as client:
-            await client.query(prompt)
+        # Update operator log with result
+        if result.get("ok"):
+            completion_note = textwrap.dedent(
+                f"""
+                ## Operator Update
+                - **Status:** Task completed successfully.
+                - **Timestamp:** {datetime.now(timezone.utc).isoformat()}
 
-            async for message in client.receive_response():
-                # Log all message types
-                if isinstance(message, UserMessage):
-                    self.logger.info(f"[{agent_name}] UserMessage: {message.content}")
-                elif isinstance(message, SystemMessage):
-                    self.logger.info(
-                        f"[{agent_name}] SystemMessage: subtype={message.subtype}, data={message.data}"
-                    )
-                elif isinstance(message, AssistantMessage):
-                    self.logger.info(
-                        f"[{agent_name}] AssistantMessage: model={message.model}, blocks={len(message.content)}"
-                    )
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            self.logger.info(f"[{agent_name}] TextBlock: {block.text}")
-                        elif isinstance(block, ThinkingBlock):
-                            self.logger.info(
-                                f"[{agent_name}] ThinkingBlock: {block.thinking}"
-                            )
-                        elif isinstance(block, ToolUseBlock):
-                            self.logger.info(
-                                f"[{agent_name}] ToolUseBlock: name={block.name}, id={block.id}, input={block.input}"
-                            )
-                        elif isinstance(block, ToolResultBlock):
-                            self.logger.info(
-                                f"[{agent_name}] ToolResultBlock: tool_use_id={block.tool_use_id}, is_error={block.is_error}"
-                            )
-                elif isinstance(message, ResultMessage):
-                    new_session_id = message.session_id
-                    # Update session_id_holder for hooks
-                    session_id_holder["session_id"] = new_session_id
-                    self.logger.info(
-                        f"[{agent_name}] ResultMessage: subtype={message.subtype}, "
-                        f"session_id={message.session_id}, is_error={message.is_error}, "
-                        f"num_turns={message.num_turns}, duration_ms={message.duration_ms}, "
-                        f"cost_usd={message.total_cost_usd}, result={message.result}"
-                    )
-                    console.print(
-                        Panel(
-                            f"{message.result}",
-                            title=f"Agent '{agent_name}' (ResultMessage)",
-                            border_style="green",
-                        )
-                    )
+                ### Output
+                ```
+                {result.get('output', '')}
+                ```
 
-        if new_session_id and new_session_id != resume_session:
-            with self.registry_lock:
-                self.agent_registry["agents"][agent_name]["session_id"] = new_session_id
-                self._save_agent_registry()
+                ### Stderr
+                ```
+                {result.get('error', '')}
+                ```
+                """
+            ).strip()
+            console.print(
+                Panel(
+                    f"Task completed for agent '{agent_name}'",
+                    title=f"Agent '{agent_name}'",
+                    border_style="green",
+                )
+            )
+        else:
+            completion_note = textwrap.dedent(
+                f"""
+                ## Operator Update
+                - **Status:** Task failed.
+                - **Error:** {result.get('error', 'Unknown error')}
+                - **Timestamp:** {datetime.now(timezone.utc).isoformat()}
+                """
+            ).strip()
+            console.print(
+                Panel(
+                    f"Task failed for agent '{agent_name}': {result.get('error')}",
+                    title=f"Agent '{agent_name}'",
+                    border_style="red",
+                )
+            )
+
+        with operator_path.open("a", encoding="utf-8") as fh:
+            fh.write("\n" + completion_note + "\n")
 
     # ------------------------------------------------------------------ #
     # Helper utilities
     # ------------------------------------------------------------------ #
-
-    async def _generate_agent_name(self, existing_names: list[str]) -> str:
-        """Generate unique agent name."""
-        existing_display = (
-            ", ".join(sorted(existing_names)) if existing_names else "none"
-        )
-        prompt_text = self._render_prompt(
-            "agent_name_generator_user_prompt.md",
-            EXISTING_NAMES=existing_display,
-        )
-        options = ClaudeAgentOptions(
-            system_prompt="Return only the requested codename."
-        )
-        text = await self._collect_text_from_query(prompt_text, options)
-        sanitized = "".join(ch for ch in text if ch.isalnum())
-        return sanitized or f"Agent{datetime.now(timezone.utc).strftime('%H%M%S')}"
-
-    async def _dedupe_agent_name(self, candidate: str) -> str:
-        """Ensure agent name is unique."""
-        name = candidate
-        existing = self.agent_registry.get("agents", {})
-        suffix = 1
-        while name in existing:
-            name = f"{candidate}{suffix}"
-            suffix += 1
-        return name
-
-    async def _generate_operator_filename(self, prompt: str) -> str:
-        """Generate operator log filename."""
-        snippet = prompt.strip().replace("\n", " ")
-        snippet = snippet[:160]
-        prompt_text = self._render_prompt(
-            "operator_filename_generator_user_prompt.md",
-            PROMPT_SNIPPET=snippet,
-        )
-        options = ClaudeAgentOptions(system_prompt="Return only the slug requested.")
-        text = await self._collect_text_from_query(prompt_text, options)
-        slug = "".join(ch if ch.isalnum() or ch == "-" else "-" for ch in text.lower())
-        slug = "-".join(filter(None, slug.split("-")))
-        return slug or f"task-{datetime.now(timezone.utc).strftime('%H%M%S')}"
-
-    async def _collect_text_from_query(
-        self, prompt: str, options: ClaudeAgentOptions
-    ) -> str:
-        """Collect text response from query."""
-        chunks: list[str] = []
-        async for message in query(prompt=prompt, options=options):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        chunks.append(block.text)
-        return "".join(chunks).strip()
 
     def _record_operator_file(self, agent_name: str, operator_path: Path) -> None:
         """Record operator file in registry."""

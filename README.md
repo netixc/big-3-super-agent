@@ -36,7 +36,6 @@ Copy `.env.sample` to `.env` and fill in required values:
 ```bash
 # Required API Keys
 OPENAI_API_KEY=sk-...           # For voice orchestration
-ANTHROPIC_API_KEY=sk-ant-...    # For Claude Code agents
 GEMINI_API_KEY=...              # For browser automation
 
 # Optional API Keys (for future extensibility)
@@ -47,14 +46,33 @@ ELEVENLABS_API_KEY=             # For advanced TTS
 # Configuration
 ENGINEER_NAME=Dan               # Your name (for agent interactions)
 AGENT_WORKING_DIRECTORY=        # Leave empty to use default (apps/content-gen)
+
+# Claude CLI Configuration (uses subscription, not API key)
+CLAUDE_CLI_PATH=                # Optional: Path to claude CLI if not in system PATH
 ```
 
-### 3. Install Playwright
+### 3. Install and Configure Claude CLI
+
+The Claude Code agent now uses the Claude CLI with your subscription instead of API keys:
+
+```bash
+# Install Claude CLI
+npm install -g @anthropic-ai/claude-code
+
+# Run it once to accept terms
+claude --dangerously-skip-permissions
+
+# Follow prompts to login and accept permissions
+```
+
+This uses your Claude Code subscription ($20/month) instead of pay-per-token API credits, which is much more cost-effective!
+
+### 4. Install Playwright
 ```bash
 playwright install
 ```
 
-### 4. Run
+### 5. Run
 ```bash
 # Voice mode (recommended for full experience)
 uv run big_three_realtime_agents.py --voice
