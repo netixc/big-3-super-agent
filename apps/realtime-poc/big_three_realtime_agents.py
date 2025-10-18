@@ -128,9 +128,10 @@ except ImportError as exc:
 
 # OpenAI Realtime API
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-REALTIME_MODEL_DEFAULT = os.environ.get("REALTIME_MODEL", "gpt-realtime-2025-08-28")
-REALTIME_MODEL_MINI = "gpt-realtime-mini-2025-10-06"
-REALTIME_API_URL_TEMPLATE = "wss://api.openai.com/v1/realtime?model={model}"
+REALTIME_API_URL = os.environ.get("REALTIME_API_URL", "wss://api.openai.com/v1/realtime")
+REALTIME_MODEL_DEFAULT = os.environ.get("REALTIME_MODEL_DEFAULT", "gpt-realtime-2025-08-28")
+REALTIME_MODEL_MINI = os.environ.get("REALTIME_MODEL_MINI", "gpt-realtime-mini-2025-10-06")
+REALTIME_API_URL_TEMPLATE = f"{REALTIME_API_URL}?model={{model}}"
 REALTIME_VOICE_CHOICE = os.environ.get("REALTIME_AGENT_VOICE", "shimmer")
 BROWSER_TOOL_STARTING_URL = os.environ.get(
     "BROWSER_TOOL_STARTING_URL", "localhost:3333"
@@ -1584,6 +1585,7 @@ class OpenAIRealtimeVoiceAgent:
         )
         self.pending_function_arguments: Dict[str, str] = {}
         self.completed_function_calls: set[str] = set()
+        self.current_response_function_calls: set[str] = set()  # Track function calls in current response
 
         # Initialize sub-agents
         self.browser_agent = GeminiBrowserAgent(logger=self.logger)
@@ -1946,7 +1948,8 @@ class OpenAIRealtimeVoiceAgent:
                     for name, data in agents.items()
                 ],
             ]
-            base_prompt = f"{base_prompt}\n\n{'\n'.join(roster_lines)}"
+            roster_text = '\n'.join(roster_lines)
+            base_prompt = f"{base_prompt}\n\n{roster_text}"
 
         return base_prompt
 
@@ -2063,6 +2066,12 @@ class OpenAIRealtimeVoiceAgent:
             event = json.loads(message)
             event_type = event.get("type", "unknown")
 
+            # Log ALL events for debugging - CRITICAL EVENTS
+            # Debug logging disabled for clean output
+            # if event_type in ("response.done", "response.created", "response.output_item.added"):
+            #     print(f"[ON_MESSAGE] Received event: {event_type}", flush=True)
+            #     self.logger.info(f"[ON_MESSAGE] Received event: {event_type}")
+
             if event_type == "error":
                 self.logger.error(
                     f"ERROR EVENT RECEIVED: {json.dumps(event, indent=2)}"
@@ -2103,6 +2112,22 @@ class OpenAIRealtimeVoiceAgent:
                 self.first_audio_delta_timestamp = None  # Reset for next response
                 self.logger.debug("User speech stopped, tracking latency")
 
+            elif event_type == "response.text.delta":
+                # Handle streaming text response (Speaches/OpenAI Realtime API)
+                delta = event.get("delta", "")
+                if delta:
+                    # Print delta to console for real-time streaming
+                    print(delta, end="", flush=True)
+                    self.logger.debug(f"Text delta: {delta}")
+
+            elif event_type == "response.audio_transcript.delta":
+                # Handle streaming audio transcript (Speaches/OpenAI Realtime API)
+                delta = event.get("delta", "")
+                if delta:
+                    # Print delta to console for real-time streaming
+                    print(delta, end="", flush=True)
+                    self.logger.debug(f"Audio transcript delta: {delta}")
+
             elif event_type == "response.output_text.done":
                 final_text = event.get("text", "")
                 if final_text:
@@ -2125,7 +2150,8 @@ class OpenAIRealtimeVoiceAgent:
 
                     self._log_panel(transcript, title=title, style="green")
 
-            elif event_type == "response.output_audio.delta":
+            elif event_type in ("response.output_audio.delta", "response.audio.delta"):
+                # Handle audio output from both OpenAI and Speaches formats
                 # Track first audio delta for latency measurement
                 if self.first_audio_delta_timestamp is None:
                     self.first_audio_delta_timestamp = time.time()
@@ -2150,6 +2176,8 @@ class OpenAIRealtimeVoiceAgent:
             if event_type == "response.function_call_arguments.delta":
                 self._handle_function_call_delta(event)
             elif event_type == "response.done":
+                # print("[EVENT] Received response.done event", flush=True)
+                # self.logger.info("[EVENT] Received response.done event")
                 self._handle_response_done(event)
 
                 # Track token usage and cost
@@ -2374,11 +2402,41 @@ class OpenAIRealtimeVoiceAgent:
 
     def _handle_response_done(self, event: Dict[str, Any]):
         """Handle completed responses with function calls."""
+        # print(f"[RESPONSE_DONE] Called with event", flush=True)
         response = event.get("response", {})
         output_items = response.get("output", [])
+        # print(f"[RESPONSE_DONE] Processing response with {len(output_items)} output items", flush=True)
+        # self.logger.info(f"[RESPONSE_DONE] Processing response with {len(output_items)} output items")
         if not output_items:
+            # print("[RESPONSE_DONE] No output items, returning early", flush=True)
+            # self.logger.info("[RESPONSE_DONE] No output items, returning early")
             return
 
+        # Collect all function call IDs from this response
+        function_call_ids = []
+        # print(f"[RESPONSE_DONE] Iterating through {len(output_items)} output items", flush=True)
+        for item in output_items:
+            item_type = item.get("type")
+            # print(f"[RESPONSE_DONE] Item type: {item_type}", flush=True)
+            if item.get("type") != "function_call":
+                continue
+
+            call_id = item.get("call_id")
+            # print(f"[RESPONSE_DONE] Found function_call with call_id: {call_id}", flush=True)
+            # print(f"[RESPONSE_DONE] Already completed: {call_id in self.completed_function_calls}", flush=True)
+            if not call_id or call_id in self.completed_function_calls:
+                continue
+
+            function_call_ids.append(call_id)
+
+        # Update current response function calls set
+        # print(f"[RESPONSE_DONE] Collected {len(function_call_ids)} function call IDs: {function_call_ids}", flush=True)
+        if function_call_ids:
+            self.current_response_function_calls = set(function_call_ids)
+            # print(f"[BATCH] Starting batch of {len(function_call_ids)} function calls: {function_call_ids}", flush=True)
+            # self.logger.info(f"[BATCH] Starting batch of {len(function_call_ids)} function calls: {function_call_ids}")
+
+        # Execute all function calls
         for item in output_items:
             if item.get("type") != "function_call":
                 continue
@@ -2469,11 +2527,59 @@ class OpenAIRealtimeVoiceAgent:
         self._send_function_output(call_id, payload)
         self.completed_function_calls.add(call_id)
 
-        response_event = {
-            "type": "response.create",
-            "response": {"output_modalities": self.default_output_modalities},
-        }
-        self.ws.send(json.dumps(response_event))
+        # print(f"[EXECUTE_TOOL] Completed tool call: {call_id}", flush=True)
+        # print(f"[EXECUTE_TOOL] current_response_function_calls: {self.current_response_function_calls}", flush=True)
+        # print(f"[EXECUTE_TOOL] completed_function_calls: {self.completed_function_calls}", flush=True)
+
+        # Check if all function calls from current response are completed
+        if self.current_response_function_calls:
+            # print(f"[EXECUTE_TOOL] Checking batch completion...", flush=True)
+            remaining = self.current_response_function_calls - self.completed_function_calls
+            # print(f"[BATCH] Function call {call_id} completed. Remaining in batch: {remaining}", flush=True)
+            # self.logger.info(f"[BATCH] Function call {call_id} completed. Remaining in batch: {remaining}")
+            # self.logger.info(f"[BATCH] Current batch: {self.current_response_function_calls}")
+            # self.logger.info(f"[BATCH] Completed so far: {self.completed_function_calls}")
+
+            if not remaining:
+                # print(f"[BATCH] INSIDE if not remaining block - remaining is: {remaining}", flush=True)
+                # All function calls completed, send response.create
+                # print(f"[BATCH] About to send delayed response.create", flush=True)
+                # self.logger.info(f"[BATCH] All function calls in batch completed, sending response.create after brief delay")
+                self.current_response_function_calls = set()  # Reset for next batch
+
+                # Add a small delay to ensure server has processed all conversation items
+                # This prevents race conditions where response.create arrives before all
+                # conversation.item.create events have been fully processed
+                def send_response_after_delay():
+                    # print(f"[BATCH] send_response_after_delay called, sleeping 50ms", flush=True)
+                    time.sleep(0.05)  # 50ms delay
+                    # print(f"[BATCH] Woke up from sleep, checking ws={self.ws is not None} running={self.running}", flush=True)
+                    try:
+                        if self.ws and self.running:
+                            response_event = {
+                                "type": "response.create",
+                                "response": {"output_modalities": self.default_output_modalities},
+                            }
+                            # print(f"[BATCH] Sending response.create event", flush=True)
+                            self.ws.send(json.dumps(response_event))
+                            # print(f"[BATCH] Successfully sent response.create", flush=True)
+                            # self.logger.info("[BATCH] Sent response.create after batch completion (delayed)")
+                    except Exception as e:
+                        # print(f"[BATCH] EXCEPTION in send_response_after_delay: {e}", flush=True)
+                        self.logger.error(f"[BATCH] Failed to send delayed response.create: {e}")
+
+                # Send in a background thread to avoid blocking
+                # print(f"[BATCH] Starting background thread for delayed response.create", flush=True)
+                threading.Thread(target=send_response_after_delay, daemon=True).start()
+                # print(f"[BATCH] Background thread started", flush=True)
+        else:
+            # Fallback for single function call (no batch tracking)
+            self.logger.info(f"[FALLBACK] Sending response.create immediately (current_response_function_calls is empty)")
+            response_event = {
+                "type": "response.create",
+                "response": {"output_modalities": self.default_output_modalities},
+            }
+            self.ws.send(json.dumps(response_event))
 
     def _send_function_output(self, call_id: str, output_payload: str):
         """Send function output back to the model."""
@@ -3054,9 +3160,15 @@ class OpenAIRealtimeVoiceAgent:
 
         # Create WebSocket connection
         websocket_url = REALTIME_API_URL_TEMPLATE.format(model=self.realtime_model)
+
+        # Only add Authorization header if connecting to OpenAI's API
+        headers = []
+        if "api.openai.com" in websocket_url and OPENAI_API_KEY:
+            headers = [f"Authorization: Bearer {OPENAI_API_KEY}"]
+
         self.ws = websocket.WebSocketApp(
             websocket_url,
-            header=[f"Authorization: Bearer {OPENAI_API_KEY}"],
+            header=headers,
             on_open=self.on_open,
             on_message=self.on_message,
             on_error=self.on_error,

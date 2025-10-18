@@ -93,6 +93,7 @@ logs/
 pip-log.txt
 pip-delete-this-directory.txt
 output_logs/
+chat.json
 
 # Database
 *.db
@@ -206,8 +207,8 @@ apps/custom_4_social_hype/*.csv
 
 .playwright*/
 
-.claude/data/
-**/.claude/data/
+.claude/
+**/.claude/
 
 apps/sora-poc/output_videos
 
