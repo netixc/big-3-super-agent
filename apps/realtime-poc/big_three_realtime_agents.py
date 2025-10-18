@@ -616,10 +616,11 @@ class ClaudeCodeAgenticCoder:
     Uses Claude CLI with --dangerously-skip-permissions for cost-effective execution.
     """
 
-    def __init__(self, logger=None, browser_agent=None):
+    def __init__(self, logger=None, browser_agent=None, completion_callback=None):
         """Initialize agentic coder manager."""
         self.logger = logger or logging.getLogger("ClaudeCodeAgenticCoder")
         self.browser_agent = browser_agent
+        self.completion_callback = completion_callback  # Callback when task completes
 
         self.registry_lock = threading.Lock()
         self.agent_registry = self._load_agent_registry()
@@ -1038,6 +1039,14 @@ class ClaudeCodeAgenticCoder:
                     border_style="green",
                 )
             )
+
+            # Notify via callback if available
+            if self.completion_callback:
+                self.completion_callback(
+                    agent_name=agent_name,
+                    status="completed",
+                    message=f"Agent '{agent_name}' has completed its task successfully.",
+                )
         else:
             completion_note = textwrap.dedent(
                 f"""
@@ -1054,6 +1063,14 @@ class ClaudeCodeAgenticCoder:
                     border_style="red",
                 )
             )
+
+            # Notify via callback if available
+            if self.completion_callback:
+                self.completion_callback(
+                    agent_name=agent_name,
+                    status="failed",
+                    message=f"Agent '{agent_name}' task failed: {result.get('error', 'Unknown error')}",
+                )
 
         with operator_path.open("a", encoding="utf-8") as fh:
             fh.write("\n" + completion_note + "\n")
@@ -1140,7 +1157,9 @@ class OpenAIRealtimeVoiceAgent:
         # Initialize sub-agents
         self.browser_agent = GeminiBrowserAgent(logger=self.logger)
         self.agentic_coder = ClaudeCodeAgenticCoder(
-            logger=self.logger, browser_agent=self.browser_agent
+            logger=self.logger,
+            browser_agent=self.browser_agent,
+            completion_callback=self._on_agent_task_complete,
         )
 
         # Build tool specs
@@ -1900,6 +1919,14 @@ class OpenAIRealtimeVoiceAgent:
             except Exception as e:
                 self.logger.error(f"Error in audio input loop: {e}")
                 break
+
+    def _on_agent_task_complete(self, agent_name: str, status: str, message: str):
+        """Callback when an agent task completes."""
+        self.logger.info(f"Agent task completion: {agent_name} - {status}")
+
+        # Send notification message to user via WebSocket
+        if self.ws and self.running:
+            self._dispatch_text_message(message)
 
     def _dispatch_text_message(self, text: str):
         """Send a text message and request a response."""
