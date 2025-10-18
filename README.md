@@ -1,22 +1,26 @@
 # Big Three Realtime Agents
-> Voice agent (OpenAI Realtime API) that orchestrates coding agents (Claude Code CLI) and browser agents (Gemini Computer Use)
+> Voice agent (OpenAI Realtime API) that orchestrates coding agents (Claude Code CLI), browser agents (Gemini Computer Use), and general-purpose AI agents (Agent Zero)
 >
 > **See this codebase in action [here](https://youtu.be/Ur3TJm0BckQ)**
 >
 
 <img src="images/big-3-super-agent.png" alt="Big Three Super Agent" style="max-width: 800px; width: 100%;">
 
-A unified voice-controlled orchestrator that coordinates three types of AI agents:
+A unified voice-controlled orchestrator that coordinates four types of AI agents:
 1. **OpenAI Realtime Voice Agent** - Natural voice interactions and orchestration
 2. **Claude Code Agentic Coder** - Software development via CLI (subscription-based, no API key needed)
 3. **Gemini Browser Agent** - Web automation and validation
+4. **Agent Zero Agent** - General-purpose AI tasks via Agent Zero API
 
 ## Requirements
 
 - **Python 3.11+**
 - **[Astral uv](https://docs.astral.sh/uv/)** - Fast Python package installer and runner
 - **Claude CLI** - Installed with Claude Code subscription (no API key needed)
-- **API Keys**: OpenAI (for Realtime API), Google Gemini (for browser automation)
+- **API Keys**:
+  - OpenAI (for Realtime API)
+  - Google Gemini (for browser automation)
+  - Agent Zero API Key (optional - for general-purpose AI agent)
 - **Playwright**: For browser automation (`playwright install` after setup)
 
 Install `uv` if you don't have it:
@@ -50,6 +54,10 @@ AGENT_WORKING_DIRECTORY=        # Leave empty to use default (apps/content-gen)
 
 # Claude CLI Configuration (uses subscription, not API key)
 CLAUDE_CLI_PATH=                # Optional: Path to claude CLI if not in system PATH
+
+# Agent Zero Configuration (optional)
+AGENT_ZERO_API_URL=             # Agent Zero API endpoint
+AGENT_ZERO_API_KEY=             # Your Agent Zero API key (generated from username/password)
 ```
 
 ### 3. Install and Configure Claude CLI
@@ -102,8 +110,10 @@ graph TD
 
     CREATE -->|Claude Code| CC[Claude Code Agent]
     CREATE -->|Gemini| GB[Gemini Browser Agent]
+    CREATE -->|Agent Zero| AZ[Agent Zero Agent]
     CMD -->|Instructions| CC
     CMD -->|Instructions| GB
+    CMD -->|Instructions| AZ
 
     CC -->|Write Code| WD[Working Directory: apps/content-gen]
     CC -->|Store Sessions| REG1[Registry: agents/claude_code/]
@@ -111,6 +121,9 @@ graph TD
     GB -->|Browse/Validate| BR[Playwright Browser]
     GB -->|Store Sessions| REG2[Registry: agents/gemini/]
     BU -->|Direct Control| BR
+
+    AZ -->|API Requests| AZAPI[Agent Zero API]
+    AZ -->|Store Sessions| REG3[Registry: agents/agent_zero/]
 
     BR -->|Screenshots| SS[output_logs/screenshots/]
 
@@ -121,6 +134,7 @@ graph TD
     style OAI fill:#ff9,stroke:#333
     style CC fill:#9cf,stroke:#333
     style GB fill:#c9f,stroke:#333
+    style AZ fill:#f9c,stroke:#333
     style WD fill:#9f9,stroke:#333
 ```
 
@@ -134,7 +148,8 @@ big-3-super-agent/
 │   ├── content-gen/           # Agent working directory (default - you can change this to any directory you want)
 │   │   ├── agents/            # Agent session registries
 │   │   │   ├── claude_code/   # Claude Code agent sessions
-│   │   │   └── gemini/        # Gemini agent sessions
+│   │   │   ├── gemini/        # Gemini agent sessions
+│   │   │   └── agent_zero/    # Agent Zero agent sessions
 │   │   ├── backend/           # Backend code (agents work here)
 │   │   ├── frontend/          # Frontend code (agents work here)
 │   │   ├── specs/             # Project specifications
@@ -149,9 +164,10 @@ big-3-super-agent/
 ### Important Files
 
 - **`big_three_realtime_agents.py`**: Main orchestrator script (3000+ lines)
-  - Line 184-616: `GeminiBrowserAgent` class
-  - Line 617-1540: `ClaudeCodeAgenticCoder` class
-  - Line 1541-2900: `OpenAIRealtimeVoiceAgent` class
+  - Line 178: `GeminiBrowserAgent` class - Browser automation
+  - Line 619: `AgentZeroAgent` class - General-purpose AI agent
+  - Line 982: `ClaudeCodeAgenticCoder` class - Software development
+  - Line 1475: `OpenAIRealtimeVoiceAgent` class - Voice orchestration
 
 - **Working Directory**: `apps/content-gen/` (configurable via `AGENT_WORKING_DIRECTORY`)
   - All Claude Code agents operate with this as their `cwd`
@@ -180,7 +196,10 @@ AGENT_WORKING_DIRECTORY = Path(__file__).parent.parent / "content-gen"
 ### 3. Tool-Based Dispatch
 The orchestrator exposes these tools to the voice agent:
 - `list_agents()` - Query all active agents and their status
-- `create_agent(tool, type, agent_name)` - Create a new agent (Claude Code or Gemini)
+- `create_agent(tool, type, agent_name, lifetime_hours)` - Create a new agent (Claude Code, Gemini, or Agent Zero)
+  - `tool='claude_code'` + `type='agentic_coding'` - Software development
+  - `tool='gemini'` + `type='agentic_browsering'` - Browser automation
+  - `tool='agent_zero'` + `type='agentic_general'` - General-purpose AI tasks
 - `command_agent(agent_name, prompt)` - Send instructions to an existing agent
 - `delete_agent(agent_name)` - Remove an agent session
 - `check_agent_result(agent_name, operator_file_name)` - Check agent execution results
