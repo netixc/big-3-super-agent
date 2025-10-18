@@ -166,8 +166,12 @@ AGENTIC_GENERAL_TYPE = "agentic_general"
 # Common agent configuration (defined after AGENT_WORKING_DIRECTORY below)
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
-# Agent working directory - set to content-gen app
-AGENT_WORKING_DIRECTORY = Path(__file__).parent.parent / "content-gen"
+# Agent working directory - can be overridden via AGENT_WORKING_DIRECTORY env var
+AGENT_WORKING_DIRECTORY = (
+    Path(os.environ.get("AGENT_WORKING_DIRECTORY"))
+    if os.environ.get("AGENT_WORKING_DIRECTORY")
+    else Path(__file__).parent.parent / "content-gen"
+)
 
 # Set AGENTS_BASE_DIR relative to working directory for consolidated outputs
 AGENTS_BASE_DIR = AGENT_WORKING_DIRECTORY / "agents"
@@ -1416,7 +1420,7 @@ class ClaudeCodeAgenticCoder:
                 self.completion_callback(
                     agent_name=agent_name,
                     status="completed",
-                    message=f"Agent '{agent_name}' has completed its task successfully.",
+                    message=f"Agent '{agent_name}' has completed its task successfully. Operator file: {operator_path.name}",
                 )
         else:
             completion_note = textwrap.dedent(
@@ -1440,7 +1444,7 @@ class ClaudeCodeAgenticCoder:
                 self.completion_callback(
                     agent_name=agent_name,
                     status="failed",
-                    message=f"Agent '{agent_name}' task failed: {result.get('error', 'Unknown error')}",
+                    message=f"Agent '{agent_name}' task failed: {result.get('error', 'Unknown error')}. Operator file: {operator_path.name}",
                 )
 
         with operator_path.open("a", encoding="utf-8") as fh:
