@@ -745,9 +745,9 @@ class AgentZeroAgent:
             return {"ok": False, "error": str(exc)}
 
     def create_agent(
-        self, agent_name: Optional[str] = None, lifetime_hours: int = 24
+        self, agent_name: Optional[str] = None, lifetime_hours: int = 24, initial_task: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Create a new Agent Zero agent."""
+        """Create a new Agent Zero agent (context will be created on first message)."""
         try:
             # Generate agent name if not provided
             if not agent_name:
@@ -760,28 +760,11 @@ class AgentZeroAgent:
                     "error": f"Agent '{agent_name}' already exists",
                 }
 
-            # Send initial message to create context
-            result = self._make_api_request(
-                "/api_message",
-                data={
-                    "message": f"Hello, I am {agent_name}. I'm ready to help with general tasks.",
-                    "lifetime_hours": lifetime_hours,
-                },
-            )
-
-            if not result["ok"]:
-                return result
-
-            response_data = result["data"]
-            context_id = response_data.get("context_id")
-
-            if not context_id:
-                return {"ok": False, "error": "No context_id returned from Agent Zero"}
-
-            # Register agent
+            # Register agent WITHOUT a context_id yet
+            # The context will be created when the first message is sent
             metadata = {
                 "created_at": datetime.now(timezone.utc).isoformat(),
-                "context_id": context_id,
+                "context_id": None,  # Will be set on first message
                 "lifetime_hours": lifetime_hours,
             }
             self._register_agent(agent_name, metadata)
@@ -791,13 +774,12 @@ class AgentZeroAgent:
             agent_dir.mkdir(parents=True, exist_ok=True)
 
             self.logger.info(
-                f"Created Agent Zero agent '{agent_name}' with context_id: {context_id}"
+                f"Created Agent Zero agent '{agent_name}' (context will be created on first message)"
             )
 
             return {
                 "ok": True,
                 "agent_name": agent_name,
-                "context_id": context_id,
                 "message": f"Agent '{agent_name}' created successfully",
             }
 
@@ -818,15 +800,22 @@ class AgentZeroAgent:
                 return {"ok": False, "error": f"Agent '{agent_name}' not found"}
 
             context_id = agent.get("context_id")
-            if not context_id:
-                return {"ok": False, "error": f"Agent '{agent_name}' has no context_id"}
 
-            # Prepare request data
-            data = {
-                "context_id": context_id,
-                "message": message,
-                "lifetime_hours": agent.get("lifetime_hours", 24),
-            }
+            # If no context_id yet, this is the first message - create the context
+            if not context_id:
+                self.logger.info(f"First message to '{agent_name}' - creating context")
+                # Prepare request data without context_id for initial message
+                data = {
+                    "message": message,
+                    "lifetime_hours": agent.get("lifetime_hours", 24),
+                }
+            else:
+                # Prepare request data with existing context_id
+                data = {
+                    "context_id": context_id,
+                    "message": message,
+                    "lifetime_hours": agent.get("lifetime_hours", 24),
+                }
 
             if attachments:
                 data["attachments"] = attachments
@@ -838,6 +827,15 @@ class AgentZeroAgent:
                 return result
 
             response_data = result["data"]
+
+            # If this was the first message, save the context_id
+            if not context_id:
+                new_context_id = response_data.get("context_id")
+                if new_context_id:
+                    with self.registry_lock:
+                        self.agent_registry["agents"][agent_name]["context_id"] = new_context_id
+                        self._save_agent_registry()
+                    self.logger.info(f"Context created for '{agent_name}': {new_context_id}")
 
             # Save response to agent directory
             agent_dir = self._agent_directory(agent_name)
@@ -3307,8 +3305,63 @@ def main():
         default=300,
         help="Auto-prompt mode timeout in seconds (default: 300). Keeps session alive for background agents to complete work.",
     )
+    parser.add_argument(
+        "--websocket-server",
+        action="store_true",
+        help="Run as WebSocket server for VTuber integration (default port: 8765)",
+    )
+    parser.add_argument(
+        "--ws-host",
+        default="0.0.0.0",
+        help="WebSocket server host (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--ws-port",
+        type=int,
+        default=8765,
+        help="WebSocket server port (default: 8765)",
+    )
 
     args = parser.parse_args()
+
+    # WebSocket server mode - run VTuber bridge instead of CLI agent
+    if args.websocket_server:
+        import asyncio
+        from vtuber_websocket_server import VTuberWebSocketBridge
+
+        logger = setup_logging()
+        logger.info("=" * 60)
+        logger.info("Big Three Realtime Agents - VTuber WebSocket Server Mode")
+        logger.info("=" * 60)
+        logger.info(f"Host: {args.ws_host}")
+        logger.info(f"Port: {args.ws_port}")
+
+        console.print(
+            Panel(
+                f"Starting VTuber WebSocket Bridge\n"
+                f"Host: {args.ws_host}\n"
+                f"Port: {args.ws_port}\n\n"
+                f"VTuber frontend should connect to:\n"
+                f"ws://{args.ws_host}:{args.ws_port}",
+                title="VTuber WebSocket Server",
+                border_style="green",
+            )
+        )
+
+        try:
+            bridge = VTuberWebSocketBridge(
+                host=args.ws_host,
+                port=args.ws_port
+            )
+            asyncio.run(bridge.start())
+        except KeyboardInterrupt:
+            logger.info("\nWebSocket server shutdown requested by user")
+        except Exception as exc:
+            logger.error(f"Fatal error in WebSocket server: {exc}", exc_info=True)
+            return 1
+
+        logger.info("WebSocket server terminated")
+        return 0
 
     startup_prompt = None
     input_mode = args.input
